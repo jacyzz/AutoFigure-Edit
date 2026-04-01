@@ -18,33 +18,50 @@
 
       <main class="input-layout">
         <section class="card">
-          <label class="field-label" for="methodText">Method Text</label>
+          <label class="field-label" for="methodText" id="methodTextLabel">Method Text</label>
           <textarea
             id="methodText"
             class="textarea"
             placeholder="Paste your paper method text here..."
           ></textarea>
-          <div class="hint">Tip: concise, structured method text yields cleaner templates.</div>
+          <div class="hint" id="methodTextHint">
+            Tip: concise, structured method text yields cleaner templates.
+          </div>
         </section>
 
         <section class="card">
+          <div class="field-group">
+            <label class="field-label" for="inputMode">Input Mode</label>
+            <select id="inputMode" class="input">
+              <option value="generate_from_text" selected>Generate from Method Text</option>
+              <option value="upload_figure">Use Uploaded Figure as Source</option>
+            </select>
+            <div class="hint" id="inputModeHint">
+              Text mode runs full pipeline; upload mode skips step 1 and starts from your image.
+            </div>
+          </div>
+
           <div class="field-group">
             <label class="field-label" for="provider">Provider</label>
             <select id="provider" class="input">
               <option value="bianxie">Bianxie</option>
               <option value="openrouter">OpenRouter</option>
               <option value="gemini" selected>Gemini (Google)</option>
+              <option value="openai_compatible">OpenAI Compatible (Custom)</option>
             </select>
+            <div class="hint" id="providerHint"></div>
           </div>
 
           <div class="field-group">
             <label class="field-label" for="apiKey">API Key</label>
             <input id="apiKey" type="password" class="input" placeholder="sk-..." />
+            <div class="hint" id="apiKeyHint"></div>
           </div>
 
           <div class="field-group">
             <label class="field-label" for="optimizeIterations">Optimize</label>
             <input id="optimizeIterations" class="input" type="number" min="0" value="0" />
+            <div class="hint" id="optimizeHint"></div>
           </div>
 
           <div class="field-group" id="imageSizeGroup">
@@ -63,6 +80,7 @@
               <option value="fal">fal.ai API</option>
               <option value="local">Local (SAM3)</option>
             </select>
+            <div class="hint" id="samBackendHint"></div>
           </div>
 
           <div class="field-group">
@@ -74,6 +92,7 @@
               value="icon,person,robot,animal"
               placeholder="icon,person,robot,animal"
             />
+            <div class="hint" id="samPromptHint"></div>
           </div>
 
           <div class="field-group" id="samApiKeyGroup" hidden>
@@ -87,16 +106,66 @@
           </div>
 
           <div class="field-group">
-            <label class="field-label" for="referenceFile">Reference Image</label>
-            <div class="upload-zone" id="uploadZone">
+            <label class="field-label" for="referenceFile" id="uploadLabel">Reference Image</label>
+            <div class="upload-zone" id="uploadZone" tabindex="0" role="button" aria-label="Upload image">
               <input id="referenceFile" class="file-input" type="file" accept="image/*" />
-              <div class="upload-text">Drop image here or click to upload</div>
+              <div class="upload-text" id="uploadText">Drop image here or click to upload</div>
             </div>
             <div class="upload-meta">
               <img id="referencePreview" class="upload-preview" alt="Reference preview" />
-              <div id="referenceStatus" class="hint"></div>
+              <div class="upload-meta-content">
+                <div id="referenceStatus" class="hint"></div>
+                <button id="clearUploadBtn" class="ghost is-hidden" type="button">Clear Image</button>
+              </div>
             </div>
           </div>
+
+          <details class="advanced">
+            <summary>Advanced Config</summary>
+
+            <div class="field-group" id="baseUrlGroup">
+              <label class="field-label" for="baseUrl">Base URL</label>
+              <input id="baseUrl" type="text" class="input" placeholder="https://api.example.com/v1" />
+              <div class="hint" id="baseUrlHint"></div>
+            </div>
+
+            <div class="field-group" id="imageModelGroup">
+              <label class="field-label" for="imageModel">Image Model</label>
+              <input id="imageModel" type="text" class="input" placeholder="Model ID for image generation" />
+              <div class="hint" id="imageModelHint"></div>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="svgModel">SVG Model</label>
+              <input id="svgModel" type="text" class="input" placeholder="Model ID for SVG generation" />
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="placeholderMode">Placeholder Mode</label>
+              <select id="placeholderMode" class="input">
+                <option value="label" selected>Label</option>
+                <option value="box">Box</option>
+                <option value="none">None</option>
+              </select>
+            </div>
+
+            <div class="field-row">
+              <div class="field-group">
+                <label class="field-label" for="mergeThreshold">Merge Threshold</label>
+                <input id="mergeThreshold" class="input" type="number" min="0" max="1" step="0.001" value="0.9" />
+              </div>
+
+              <div class="field-group">
+                <label class="field-label" for="minScore">Min Score</label>
+                <input id="minScore" class="input" type="number" min="0" max="1" step="0.01" value="0.0" />
+              </div>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="samMaxMasks">SAM Max Masks</label>
+              <input id="samMaxMasks" class="input" type="number" min="1" max="32" step="1" value="32" />
+            </div>
+          </details>
         </section>
 
         <section class="actions">

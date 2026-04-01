@@ -188,7 +188,7 @@ select {
   position: absolute;
   inset: 0;
   opacity: 0;
-  cursor: pointer;
+  pointer-events: none;
 }
 
 .upload-text {
@@ -200,9 +200,17 @@ select {
 
 .upload-meta {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   margin-top: 10px;
+}
+
+.upload-meta-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 64px;
 }
 
 .upload-preview {
@@ -217,6 +225,11 @@ select {
 
 .upload-preview.visible {
   display: block;
+}
+
+.upload-zone:focus-visible {
+  outline: 2px solid rgba(22, 155, 155, 0.6);
+  outline-offset: 3px;
 }
 
 .hint {

@@ -5,6 +5,7 @@ Paper Method 到 SVG 图标替换完整流程 (Label 模式增强版 + Box合并
 - openrouter: OpenRouter API (https://openrouter.ai/api/v1)
 - bianxie: Bianxie API (https://api.bianxie.ai/v1) - 使用 OpenAI SDK
 - gemini: Google Gemini 官方 API (https://ai.google.dev/)
+- openai_compatible: 任意 OpenAI 兼容网关（自定义 base_url）
 
 占位符模式 (--placeholder_mode):
 - none: 无特殊样式（默认黑色边框）
@@ -83,33 +84,21 @@ from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
 
+from config import (
+    DEFAULT_CLI_PROVIDER,
+    DEFAULT_CLI_SAM_BACKEND,
+    DEFAULT_IMAGE_SIZE,
+    IMAGE_SIZE_CHOICES,
+    PROVIDER_CONFIGS,
+    resolve_provider_api_key,
+    resolve_provider_settings,
+    resolve_sam_settings,
+)
 
-# ============================================================================
-# Provider 配置
-# ============================================================================
 
-PROVIDER_CONFIGS = {
-    "openrouter": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "default_image_model": "google/gemini-3-pro-image-preview",
-        "default_svg_model": "google/gemini-3.1-pro-preview",
-    },
-    "bianxie": {
-        "base_url": "https://api.bianxie.ai/v1",
-        "default_image_model": "gemini-3-pro-image-preview",
-        "default_svg_model": "gemini-3.1-pro-preview",
-    },
-    "gemini": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "default_image_model": "gemini-3-pro-image-preview",
-        "default_svg_model": "gemini-3.1-pro",
-    },
-}
-
-ProviderType = Literal["openrouter", "bianxie", "gemini"]
+ProviderType = Literal["openrouter", "bianxie", "gemini", "openai_compatible"]
 PlaceholderMode = Literal["none", "box", "label"]
-GEMINI_DEFAULT_IMAGE_SIZE = "4K"
-IMAGE_SIZE_CHOICES = ("1K", "2K", "4K")
+GEMINI_DEFAULT_IMAGE_SIZE = DEFAULT_IMAGE_SIZE
 BOXLIB_NO_ICON_MODE_KEY = "no_icon_mode"
 
 # SAM3 API config
@@ -154,7 +143,7 @@ def call_llm_text(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
+    if provider in {"bianxie", "openai_compatible"}:
         return _call_bianxie_text(prompt, api_key, model, base_url, max_tokens, temperature)
     if provider == "gemini":
         return _call_gemini_text(prompt, api_key, model, max_tokens, temperature)
@@ -185,7 +174,7 @@ def call_llm_multimodal(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
+    if provider in {"bianxie", "openai_compatible"}:
         return _call_bianxie_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
     if provider == "gemini":
         return _call_gemini_multimodal(contents, api_key, model, max_tokens, temperature)
@@ -214,7 +203,16 @@ def call_llm_image_generation(
     Returns:
         生成的 PIL Image，失败返回 None
     """
-    if provider == "bianxie":
+    if provider == "openai_compatible":
+        return _call_openai_compatible_image_generation(
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reference_image=reference_image,
+            image_size=image_size,
+        )
+    if provider in {"bianxie", "openai_compatible"}:
         return _call_bianxie_image_generation(prompt, api_key, model, base_url, reference_image)
     if provider == "gemini":
         return _call_gemini_image_generation(
@@ -345,6 +343,65 @@ def _call_bianxie_image_generation(
         return None
     except Exception as e:
         print(f"[Bianxie] 图像生成 API 调用失败: {e}")
+        raise
+
+
+def _call_openai_compatible_image_generation(
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    reference_image: Optional[Image.Image] = None,
+    image_size: str = GEMINI_DEFAULT_IMAGE_SIZE,
+) -> Optional[Image.Image]:
+    """使用 OpenAI Images API 调用兼容网关的生图接口。"""
+    try:
+        from openai import OpenAI
+
+        if reference_image is not None:
+            raise ValueError(
+                "openai_compatible provider 当前仅支持 text-to-image。"
+                "参考图风格迁移尚未适配 images.generate 接口。"
+            )
+
+        client = OpenAI(base_url=base_url, api_key=api_key)
+
+        request_kwargs: Dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "response_format": "url",
+        }
+        if image_size:
+            request_kwargs["size"] = image_size
+
+        images_response = client.images.generate(**request_kwargs)
+
+        data_items = getattr(images_response, "data", None) or []
+        if not data_items:
+            return None
+
+        first_item = data_items[0]
+        image_b64 = getattr(first_item, "b64_json", None)
+        if isinstance(image_b64, str) and image_b64.strip():
+            image_data = base64.b64decode(image_b64)
+            image = Image.open(io.BytesIO(image_data))
+            image.load()
+            return image
+
+        image_url = getattr(first_item, "url", None)
+        if isinstance(image_url, str) and image_url.strip():
+            response = requests.get(image_url, timeout=120)
+            if response.status_code != 200 or not response.content:
+                raise RuntimeError(
+                    f"images.generate 返回了 URL，但下载失败: status={response.status_code}"
+                )
+            image = Image.open(io.BytesIO(response.content))
+            image.load()
+            return image
+
+        return None
+    except Exception as e:
+        print(f"[OpenAI-Compatible] 图像生成 API 调用失败: {e}")
         raise
 
 
@@ -944,6 +1001,31 @@ def _call_gemini_image_generation(
 # ============================================================================
 # 步骤一：调用 LLM 生成图片
 # ============================================================================
+
+def prepare_uploaded_figure(
+    source_image_path: str,
+    output_path: str,
+) -> str:
+    """将上传图片标准化为流程使用的 figure.png（RGB PNG）。"""
+    print("=" * 60)
+    print("步骤一：使用上传图片作为源图")
+    print("=" * 60)
+
+    source_path = Path(source_image_path)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"上传图片不存在: {source_image_path}")
+
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+    with Image.open(source_path) as src:
+        normalized = src.convert("RGB")
+        normalized.save(output_path_obj, format="PNG")
+
+    print(f"已使用上传图片作为流程输入: {source_path}")
+    print(f"标准化 figure.png: {output_path_obj}")
+    return str(output_path_obj)
+
 
 def generate_figure_from_method(
     method_text: str,
@@ -2836,34 +2918,38 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
 # ============================================================================
 
 def method_to_svg(
-    method_text: str,
+    method_text: Optional[str] = None,
     output_dir: str = "./output",
-    api_key: str = None,
-    base_url: str = None,
-    provider: ProviderType = "bianxie",
-    image_gen_model: str = None,
-    svg_gen_model: str = None,
-    sam_prompts: str = "icon",
-    min_score: float = 0.5,
-    sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[ProviderType] = None,
+    input_mode: Literal["generate_from_text", "upload_figure"] = "generate_from_text",
+    source_image_path: Optional[str] = None,
+    image_gen_model: Optional[str] = None,
+    svg_gen_model: Optional[str] = None,
+    sam_prompts: Optional[str] = None,
+    min_score: Optional[float] = None,
+    sam_backend: Optional[Literal["local", "fal", "roboflow", "api"]] = None,
     sam_api_key: Optional[str] = None,
-    sam_max_masks: int = 32,
+    sam_max_masks: Optional[int] = None,
     rmbg_model_path: Optional[str] = None,
     stop_after: int = 5,
-    placeholder_mode: PlaceholderMode = "label",
-    optimize_iterations: int = 2,
-    merge_threshold: float = 0.9,
-    image_size: str = GEMINI_DEFAULT_IMAGE_SIZE,
+    placeholder_mode: Optional[PlaceholderMode] = None,
+    optimize_iterations: Optional[int] = None,
+    merge_threshold: Optional[float] = None,
+    image_size: Optional[str] = None,
 ) -> dict:
     """
     完整流程：Paper Method → SVG with Icons
 
     Args:
-        method_text: Paper method 文本内容
+        method_text: Paper method 文本内容（generate_from_text 模式必填）
         output_dir: 输出目录
         api_key: API Key
         base_url: API base URL
         provider: API 提供商
+        input_mode: 输入模式（generate_from_text / upload_figure）
+        source_image_path: 上传的源图路径（upload_figure 模式必填）
         image_gen_model: 生图模型
         svg_gen_model: SVG 生成模型
         sam_prompts: SAM3 文本提示，支持逗号分隔的多个prompt（如 "icon,diagram,arrow"）
@@ -2883,17 +2969,56 @@ def method_to_svg(
     Returns:
         结果字典
     """
-    if not api_key:
-        raise ValueError("必须提供 api_key")
+    if input_mode not in {"generate_from_text", "upload_figure"}:
+        raise ValueError(f"不支持的 input_mode: {input_mode}")
+    if source_image_path:
+        input_mode = "upload_figure"
 
-    # 获取默认配置
-    config = PROVIDER_CONFIGS[provider]
-    if base_url is None:
-        base_url = config["base_url"]
-    if image_gen_model is None:
-        image_gen_model = config["default_image_model"]
-    if svg_gen_model is None:
-        svg_gen_model = config["default_svg_model"]
+    if input_mode == "upload_figure" and not source_image_path:
+        raise ValueError("input_mode=upload_figure 时必须提供 source_image_path")
+    if input_mode == "generate_from_text":
+        if not method_text or not method_text.strip():
+            raise ValueError("input_mode=generate_from_text 时必须提供 method_text")
+        method_text = method_text.strip()
+
+    provider_settings = resolve_provider_settings(
+        provider=provider,
+        base_url=base_url,
+        image_model=image_gen_model,
+        svg_model=svg_gen_model,
+        image_size=image_size,
+        provider_fallback=DEFAULT_CLI_PROVIDER,
+    )
+    provider = provider_settings["provider"]
+    base_url = provider_settings["base_url"]
+    image_gen_model = provider_settings["image_model"]
+    svg_gen_model = provider_settings["svg_model"]
+    image_size = provider_settings["image_size"]
+
+    api_key = resolve_provider_api_key(provider, api_key)
+    if not api_key:
+        raise ValueError(
+            f"必须提供 api_key（provider={provider}）。"
+            "可通过参数显式传入，或在 .env 中配置对应 provider 的 API key。"
+        )
+
+    sam_settings = resolve_sam_settings(
+        sam_backend=sam_backend,
+        sam_prompt=sam_prompts,
+        min_score=min_score,
+        sam_max_masks=sam_max_masks,
+        placeholder_mode=placeholder_mode,
+        merge_threshold=merge_threshold,
+        optimize_iterations=optimize_iterations,
+        sam_backend_fallback=DEFAULT_CLI_SAM_BACKEND,
+    )
+    sam_prompts = sam_settings["sam_prompt"]
+    min_score = sam_settings["min_score"]
+    sam_backend = sam_settings["sam_backend"]
+    sam_max_masks = sam_settings["sam_max_masks"]
+    placeholder_mode = sam_settings["placeholder_mode"]
+    optimize_iterations = sam_settings["optimize_iterations"]
+    merge_threshold = sam_settings["merge_threshold"]
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2902,6 +3027,9 @@ def method_to_svg(
     print("Paper Method 到 SVG 图标替换流程 (Label 模式增强版 + Box合并)")
     print("=" * 60)
     print(f"Provider: {provider}")
+    print(f"输入模式: {input_mode}")
+    if source_image_path:
+        print(f"上传源图: {source_image_path}")
     print(f"输出目录: {output_dir}")
     print(f"生图模型: {image_gen_model}")
     print(f"SVG模型: {svg_gen_model}")
@@ -2919,17 +3047,23 @@ def method_to_svg(
         print(f"生图分辨率: {image_size}")
     print("=" * 60)
 
-    # 步骤一：生成图片
+    # 步骤一：生成图片 / 使用上传图片
     figure_path = output_dir / "figure.png"
-    generate_figure_from_method(
-        method_text=method_text,
-        output_path=str(figure_path),
-        api_key=api_key,
-        model=image_gen_model,
-        base_url=base_url,
-        provider=provider,
-        image_size=image_size,
-    )
+    if input_mode == "upload_figure":
+        prepare_uploaded_figure(
+            source_image_path=source_image_path,
+            output_path=str(figure_path),
+        )
+    else:
+        generate_figure_from_method(
+            method_text=method_text,
+            output_path=str(figure_path),
+            api_key=api_key,
+            model=image_gen_model,
+            base_url=base_url,
+            provider=provider,
+            image_size=image_size,
+        )
 
     if stop_after == 1:
         print("\n" + "=" * 60)
@@ -3170,9 +3304,16 @@ if __name__ == "__main__":
     )
 
     # 输入参数
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--method_text", help="Paper method 文本内容")
-    input_group.add_argument("--method_file", default="./paper.txt", help="包含 paper method 的文本文件路径")
+    parser.add_argument(
+        "--input_mode",
+        choices=["generate_from_text", "upload_figure"],
+        default="generate_from_text",
+        help="输入模式：generate_from_text(方法文本生图) / upload_figure(上传图片直通SVG流程)",
+    )
+    input_group = parser.add_mutually_exclusive_group(required=False)
+    input_group.add_argument("--method_text", help="Paper method 文本内容（generate_from_text 模式）")
+    input_group.add_argument("--method_file", default=None, help="包含 paper method 的文本文件路径（generate_from_text 模式）")
+    parser.add_argument("--source_image_path", default=None, help="上传源图路径（upload_figure 模式）")
 
     # 输出参数
     parser.add_argument("--output_dir", default="./output", help="输出目录（默认: ./output）")
@@ -3180,24 +3321,24 @@ if __name__ == "__main__":
     # Provider 参数
     parser.add_argument(
         "--provider",
-        choices=["openrouter", "bianxie", "gemini"],
-        default="bianxie",
-        help="API 提供商（默认: bianxie）"
+        choices=["openrouter", "bianxie", "gemini", "openai_compatible"],
+        default=None,
+        help="API 提供商（默认优先读取 .env，否则使用内置默认）"
     )
 
     # API 参数
-    parser.add_argument("--api_key", default=None, help="API Key")
-    parser.add_argument("--base_url", default=None, help="API base URL（默认根据 provider 自动设置）")
+    parser.add_argument("--api_key", default=None, help="API Key（可留空并从 .env 读取）")
+    parser.add_argument("--base_url", default=None, help="API base URL（默认优先读取 .env，否则根据 provider 自动设置）")
 
     # 模型参数
-    parser.add_argument("--image_model", default=None, help="生图模型（默认根据 provider 自动设置）")
+    parser.add_argument("--image_model", default=None, help="生图模型（默认优先读取 .env，否则根据 provider 自动设置）")
     parser.add_argument(
         "--image_size",
         choices=list(IMAGE_SIZE_CHOICES),
-        default=GEMINI_DEFAULT_IMAGE_SIZE,
-        help="生图分辨率（可选: 1K/2K/4K，默认: 4K）",
+        default=None,
+        help="生图分辨率（可选: 1K/2K/4K，默认优先读取 .env）",
     )
-    parser.add_argument("--svg_model", default=None, help="SVG生成模型（默认根据 provider 自动设置）")
+    parser.add_argument("--svg_model", default=None, help="SVG生成模型（默认优先读取 .env，否则根据 provider 自动设置）")
 
     # Step 1 参考图片参数
     parser.add_argument(
@@ -3208,20 +3349,20 @@ if __name__ == "__main__":
     parser.add_argument("--reference_image_path", default=None, help="参考图片路径（可选）")
 
     # SAM3 参数
-    parser.add_argument("--sam_prompt", default="icon,robot,animal,person", help="SAM3 文本提示，支持逗号分隔多个prompt（如 'icon,diagram,arrow'，默认: icon）")
-    parser.add_argument("--min_score", type=float, default=0.0, help="SAM3 最低置信度阈值（默认: 0.0）")
+    parser.add_argument("--sam_prompt", default=None, help="SAM3 文本提示，支持逗号分隔多个prompt（默认优先读取 .env）")
+    parser.add_argument("--min_score", type=float, default=None, help="SAM3 最低置信度阈值（默认优先读取 .env）")
     parser.add_argument(
         "--sam_backend",
         choices=["local", "fal", "roboflow", "api"],
-        default="local",
-        help="SAM3 后端：local(本地部署)/fal(fal.ai)/roboflow(Roboflow)/api(旧别名=fal)",
+        default=None,
+        help="SAM3 后端：local/fal/roboflow/api（默认优先读取 .env）",
     )
     parser.add_argument("--sam_api_key", default=None, help="SAM3 API Key（默认使用 FAL_KEY）")
     parser.add_argument(
         "--sam_max_masks",
         type=int,
-        default=32,
-        help="SAM3 API 最大 masks 数（仅 api 后端，默认: 32）",
+        default=None,
+        help="SAM3 API 最大 masks 数（默认优先读取 .env）",
     )
 
     # RMBG 参数
@@ -3240,24 +3381,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--placeholder_mode",
         choices=["none", "box", "label"],
-        default="label",
-        help="占位符模式：none(无样式)/box(传坐标)/label(序号匹配)（默认: label）"
+        default=None,
+        help="占位符模式：none/box/label（默认优先读取 .env）"
     )
 
     # 步骤 4.6 优化迭代次数参数
     parser.add_argument(
         "--optimize_iterations",
         type=int,
-        default=0,
-        help="步骤 4.6 LLM 优化迭代次数（0 表示跳过优化，默认: 0）"
+        default=None,
+        help="步骤 4.6 LLM 优化迭代次数（默认优先读取 .env）"
     )
 
     # Box 合并阈值参数
     parser.add_argument(
         "--merge_threshold",
         type=float,
-        default=0.001,
-        help="Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认: 0.9）"
+        default=None,
+        help="Box合并阈值（默认优先读取 .env）"
     )
 
     args = parser.parse_args()
@@ -3266,15 +3407,26 @@ if __name__ == "__main__":
         parser.error("--use_reference_image 需要 --reference_image_path")
     if args.reference_image_path and not Path(args.reference_image_path).is_file():
         parser.error(f"参考图片不存在: {args.reference_image_path}")
+    if args.source_image_path and not Path(args.source_image_path).is_file():
+        parser.error(f"上传源图不存在: {args.source_image_path}")
+
+    if args.source_image_path:
+        args.input_mode = "upload_figure"
+    if args.input_mode == "upload_figure" and not args.source_image_path:
+        parser.error("input_mode=upload_figure 时必须提供 --source_image_path")
+    if args.input_mode == "generate_from_text" and not (args.method_text or args.method_file):
+        parser.error("input_mode=generate_from_text 时必须提供 --method_text 或 --method_file")
 
     USE_REFERENCE_IMAGE = bool(args.use_reference_image)
     REFERENCE_IMAGE_PATH = args.reference_image_path
     if REFERENCE_IMAGE_PATH:
         USE_REFERENCE_IMAGE = True
 
-    # 获取 method 文本：优先使用 --method_text
+    # 获取 method 文本：仅 generate_from_text 模式需要
     method_text = args.method_text
-    if method_text is None:
+    if args.input_mode == "generate_from_text" and method_text is None:
+        if not args.method_file:
+            parser.error("generate_from_text 模式必须提供方法文本")
         with open(args.method_file, 'r', encoding='utf-8') as f:
             method_text = f.read()
 
@@ -3285,6 +3437,8 @@ if __name__ == "__main__":
         api_key=args.api_key,
         base_url=args.base_url,
         provider=args.provider,
+        input_mode=args.input_mode,
+        source_image_path=args.source_image_path,
         image_gen_model=args.image_model,
         image_size=args.image_size,
         svg_gen_model=args.svg_model,

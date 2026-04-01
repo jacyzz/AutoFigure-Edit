@@ -14,12 +14,26 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from config import (
+    DEFAULT_MERGE_THRESHOLD,
+    DEFAULT_MIN_SCORE,
+    DEFAULT_OPTIMIZE_ITERATIONS,
+    DEFAULT_PLACEHOLDER_MODE,
+    DEFAULT_SAM_PROMPT,
+    DEFAULT_WEB_PROVIDER,
+    DEFAULT_WEB_SAM_BACKEND,
+    build_public_web_config,
+    resolve_provider_api_key,
+    resolve_provider_settings,
+    resolve_sam_settings,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,10 +44,6 @@ UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 PYTHON_EXECUTABLE = os.environ.get("AUTOFIGURE_PYTHON") or sys.executable
-
-DEFAULT_SAM_PROMPT = "icon,person,robot,animal"
-DEFAULT_PLACEHOLDER_MODE = "label"
-DEFAULT_MERGE_THRESHOLD = 0.01
 
 SVG_EDIT_CANDIDATES = [
     ("vendor/svg-edit/editor/index.html", WEB_DIR / "vendor" / "svg-edit" / "editor" / "index.html"),
@@ -86,13 +96,15 @@ class Job:
 
 
 class RunRequest(BaseModel):
-    method_text: str = Field(..., min_length=1)
-    provider: str = "bianxie"
+    input_mode: Literal["generate_from_text", "upload_figure"] = "generate_from_text"
+    method_text: Optional[str] = None
+    provider: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     image_model: Optional[str] = None
     image_size: Optional[str] = None
     svg_model: Optional[str] = None
+    min_score: Optional[float] = None
     sam_prompt: Optional[str] = None
     sam_backend: Optional[str] = None
     sam_api_key: Optional[str] = None
@@ -101,6 +113,7 @@ class RunRequest(BaseModel):
     merge_threshold: Optional[float] = None
     optimize_iterations: Optional[int] = None
     reference_image_path: Optional[str] = None
+    source_image_path: Optional[str] = None
 
 
 app = FastAPI()
@@ -116,54 +129,104 @@ def healthz() -> JSONResponse:
 @app.get("/api/config")
 def get_config() -> JSONResponse:
     available, rel_path = _resolve_svg_edit_path()
-    return JSONResponse({"svgEditAvailable": available, "svgEditPath": rel_path})
+    payload = build_public_web_config()
+    payload["svgEditAvailable"] = available
+    payload["svgEditPath"] = rel_path
+    return JSONResponse(
+        payload
+    )
 
 
 @app.post("/api/run")
 def run_job(req: RunRequest) -> JSONResponse:
+    method_text = (req.method_text or "").strip()
+    if req.input_mode == "upload_figure":
+        if not req.source_image_path:
+            raise HTTPException(
+                status_code=400,
+                detail="source_image_path is required when input_mode=upload_figure",
+            )
+    elif req.input_mode == "generate_from_text":
+        if not method_text:
+            raise HTTPException(
+                status_code=400,
+                detail="method_text is required when input_mode=generate_from_text",
+            )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported input_mode: {req.input_mode}")
+
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
     output_dir = OUTPUTS_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    provider_settings = resolve_provider_settings(
+        provider=req.provider,
+        base_url=req.base_url,
+        image_model=req.image_model,
+        svg_model=req.svg_model,
+        image_size=req.image_size,
+        provider_fallback=DEFAULT_WEB_PROVIDER,
+    )
+    api_key = resolve_provider_api_key(
+        provider_settings["provider"],
+        req.api_key,
+    )
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing API key for provider={provider_settings['provider']}. "
+                "Provide api_key in request or configure server-side .env."
+            ),
+        )
+
+    sam_settings = resolve_sam_settings(
+        sam_backend=req.sam_backend,
+        sam_prompt=req.sam_prompt,
+        min_score=req.min_score,
+        sam_max_masks=req.sam_max_masks,
+        placeholder_mode=req.placeholder_mode,
+        merge_threshold=req.merge_threshold,
+        optimize_iterations=req.optimize_iterations,
+        sam_backend_fallback=DEFAULT_WEB_SAM_BACKEND,
+    )
+
     cmd = [
         PYTHON_EXECUTABLE,
         str(BASE_DIR / "autofigure2.py"),
-        "--method_text",
-        req.method_text,
         "--output_dir",
         str(output_dir),
         "--provider",
-        req.provider,
+        provider_settings["provider"],
+        "--input_mode",
+        req.input_mode,
     ]
 
-    if req.api_key:
-        cmd += ["--api_key", req.api_key]
-    if req.base_url:
-        cmd += ["--base_url", req.base_url]
-    if req.image_model:
-        cmd += ["--image_model", req.image_model]
-    if req.image_size:
-        cmd += ["--image_size", req.image_size]
-    if req.svg_model:
-        cmd += ["--svg_model", req.svg_model]
+    if method_text:
+        cmd += ["--method_text", method_text]
+    cmd += ["--api_key", api_key]
+    if provider_settings["base_url"]:
+        cmd += ["--base_url", provider_settings["base_url"]]
+    if provider_settings["image_model"]:
+        cmd += ["--image_model", provider_settings["image_model"]]
+    if provider_settings["image_size"]:
+        cmd += ["--image_size", provider_settings["image_size"]]
+    if provider_settings["svg_model"]:
+        cmd += ["--svg_model", provider_settings["svg_model"]]
+    if sam_settings["min_score"] is not None:
+        cmd += ["--min_score", str(sam_settings["min_score"])]
 
-    sam_prompt = req.sam_prompt or DEFAULT_SAM_PROMPT
-    placeholder_mode = req.placeholder_mode or DEFAULT_PLACEHOLDER_MODE
-    merge_threshold = (
-        req.merge_threshold if req.merge_threshold is not None else DEFAULT_MERGE_THRESHOLD
-    )
-
-    cmd += ["--sam_prompt", sam_prompt]
-    cmd += ["--placeholder_mode", placeholder_mode]
-    cmd += ["--merge_threshold", str(merge_threshold)]
-    if req.sam_backend:
-        cmd += ["--sam_backend", req.sam_backend]
+    cmd += ["--sam_prompt", sam_settings["sam_prompt"]]
+    cmd += ["--placeholder_mode", sam_settings["placeholder_mode"]]
+    cmd += ["--merge_threshold", str(sam_settings["merge_threshold"])]
+    if sam_settings["sam_backend"]:
+        cmd += ["--sam_backend", sam_settings["sam_backend"]]
     if req.sam_api_key:
         cmd += ["--sam_api_key", req.sam_api_key]
-    if req.sam_max_masks is not None:
-        cmd += ["--sam_max_masks", str(req.sam_max_masks)]
-    if req.optimize_iterations is not None:
-        cmd += ["--optimize_iterations", str(req.optimize_iterations)]
+    if sam_settings["sam_max_masks"] is not None:
+        cmd += ["--sam_max_masks", str(sam_settings["sam_max_masks"])]
+    if sam_settings["optimize_iterations"] is not None:
+        cmd += ["--optimize_iterations", str(sam_settings["optimize_iterations"])]
 
     reference_path = req.reference_image_path
     if reference_path:
@@ -173,6 +236,15 @@ def run_job(req: RunRequest) -> JSONResponse:
             else reference_path
         )
         cmd += ["--reference_image_path", reference_path]
+
+    source_path = req.source_image_path
+    if source_path:
+        source_path = (
+            str((BASE_DIR / source_path).resolve())
+            if not Path(source_path).is_absolute()
+            else source_path
+        )
+        cmd += ["--source_image_path", source_path]
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -278,6 +350,18 @@ def get_upload(filename: str) -> FileResponse:
     return FileResponse(candidate)
 
 
+@app.delete("/api/uploads/{filename}")
+def delete_upload(filename: str) -> JSONResponse:
+    candidate = (UPLOADS_DIR / filename).resolve()
+    if not str(candidate).startswith(str(UPLOADS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if candidate.exists():
+        if not candidate.is_file():
+            raise HTTPException(status_code=400, detail="Invalid upload target")
+        candidate.unlink()
+    return JSONResponse({"deleted": True, "filename": filename})
+
+
 def _format_sse(event: str, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=True)
     return f"event: {event}\ndata: {payload}\n\n"
@@ -340,6 +424,7 @@ def _scan_artifacts(job: Job) -> None:
         output_dir / "figure.png",
         output_dir / "samed.png",
         output_dir / "template.svg",
+        output_dir / "optimized_template.svg",
         output_dir / "final.svg",
     ]
 
@@ -378,6 +463,8 @@ def _classify_artifact(rel_path: str) -> str:
         return "icon_raw"
     if rel_path == "template.svg":
         return "template_svg"
+    if rel_path == "optimized_template.svg":
+        return "optimized_template_svg"
     if rel_path == "final.svg":
         return "final_svg"
     return "artifact"
